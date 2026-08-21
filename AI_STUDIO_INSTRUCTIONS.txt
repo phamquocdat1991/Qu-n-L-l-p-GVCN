@@ -1,0 +1,18 @@
+GVCN PRO — HƯỚNG DẪN DÙNG TRONG GOOGLE AI STUDIO BUILD
+
+MỤC TIÊU
+- Giữ nguyên index.html hiện có.
+- Không refactor sang React/Vue/Angular.
+- Không đổi Firebase config.
+- Không đổi khóa localStorage: chuyen_tau_data.
+- Không đổi cloudAppId / đường dẫn Firestore hiện tại.
+- Không đổi CSS, bố cục, màu sắc, nội dung, quyền, tính năng hoặc schema dữ liệu.
+
+CÁCH CHẠY
+1. Đưa toàn bộ thư mục/project này vào Google AI Studio Build.
+2. Yêu cầu Agent sử dụng project hiện có, KHÔNG tái tạo giao diện.
+3. Chạy lệnh: npm start
+4. Preview sử dụng PORT do môi trường cấp; server.mjs đã tự đọc process.env.PORT.
+
+PROMPT NÊN DÁN CHO AGENT
+"Hãy chạy nguyên trạng project tôi tải lên. Tuyệt đối không refactor hoặc tái tạo index.html, không chuyển framework, không đổi giao diện, không đổi Firebase config, không đổi localStorage key chuyen_tau_data, không đổi schema dữ liệu hay đường dẫn Firestore. Chỉ dùng server.mjs và package.json hiện có để phục vụ index.html. Nếu cần sửa lỗi tương thích môi trường thì chỉ sửa lớp server/cấu hình, không sửa logic ứng dụng trừ khi thật sự bắt buộc. Sau đó chạy npm start và kiểm tra preview."

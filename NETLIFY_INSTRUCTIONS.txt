@@ -1,0 +1,19 @@
+GVCN PRO — TRIỂN KHAI NETLIFY
+
+CÁCH 1 — Manual Deploy, ít rủi ro nhất
+1. Giải nén gói ZIP.
+2. Vào Netlify > Add new site > Deploy manually.
+3. Kéo THƯ MỤC GVCN_PRO_AIStudio_Netlify vào vùng deploy.
+4. Netlify sẽ dùng index.html ở thư mục gốc; không cần build.
+
+CÁCH 2 — Git
+1. Đưa toàn bộ thư mục lên GitHub.
+2. Import repository vào Netlify.
+3. Build command: để trống.
+4. Publish directory: .
+
+LƯU Ý FIREBASE
+- Firebase config trong index.html được giữ nguyên.
+- Anonymous Authentication phải đang bật trong Firebase project.
+- Nếu project có giới hạn domain/API key hoặc Firebase Auth yêu cầu domain được ủy quyền, hãy thêm domain Netlify/custom domain tương ứng trong Firebase Console.
+- Firestore Security Rules vẫn quyết định quyền đọc/ghi dữ liệu; gói này không thay đổi rules.

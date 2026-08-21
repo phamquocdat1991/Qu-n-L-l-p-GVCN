@@ -1,0 +1,9 @@
+GVCN PRO — KIỂM TRA TÍNH TOÀN VẸN
+
+1. index.html được sao chép byte-for-byte từ file người dùng cung cấp.
+2. Không đổi giao diện HTML/CSS/JS của app.
+3. Không đổi Firebase config.
+4. Không đổi localStorage/sessionStorage keys.
+5. Không đổi schema state hoặc đường dẫn Firestore.
+6. Đã kiểm tra cú pháp tất cả inline JavaScript bằng Node.js --check: PASS.
+7. Lớp bổ sung chỉ gồm server.mjs, package.json, netlify.toml và tài liệu triển khai.
