@@ -1073,35 +1073,99 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
                 }, 50);
             }
         };
-        // --- 3. INIT & DATA LOAD ---
-        window.startApp = function() {
-            if (window.useCloud && window.cloudDb && window.cloudUser) {
-                const docRef = window.cloudDoc(window.cloudDb, 'artifacts', window.cloudAppId, 'users', window.cloudUser.uid, 'classData', 'main');
-                window.cloudOnSnapshot(docRef, (docSnap) => {
-                    if (docSnap.exists()) {
-                        const parsed = docSnap.data().state; state = { ...state, ...parsed }; applyStateDefaults();
-                        if (!isDataLoaded) { isDataLoaded = true; renderLayout(); showToast("Đã đồng bộ Dữ liệu Đám mây!", "success"); } else { renderLayout(); }
-                    } else { fallbackLoad(true); }
-                }, (error) => { fallbackLoad(); });
-            } else { fallbackLoad(); }
-        }
+        // --- 3. INIT & DATA LOAD (SAFE PERSISTENCE FOR NETLIFY) ---
+        // Giữ nguyên key cũ để toàn bộ dữ liệu đã lưu trước đây vẫn tương thích.
+        const LOCAL_STORAGE_KEY = 'chuyen_tau_data';
 
-        function fallbackLoad(isFirstCloudSync = false) {
+        function loadLocalDataIntoState() {
             try {
-                const savedData = localStorage.getItem('chuyen_tau_data');
-                if (savedData) { state = { ...state, ...JSON.parse(savedData) }; applyStateDefaults(); } else { initDefaultStudents(); applyStateDefaults(); saveData(); }
-            } catch (err) { initDefaultStudents(); applyStateDefaults(); saveData(); }
-            isDataLoaded = true; renderLayout();
-            if(isFirstCloudSync) { saveData(); showToast("Đã thiết lập Đám mây!", "success"); }
+                const savedData = localStorage.getItem(LOCAL_STORAGE_KEY);
+                if (!savedData) {
+                    window.__hasLocalData = false;
+                    return false;
+                }
+                const parsed = JSON.parse(savedData);
+                if (!parsed || typeof parsed !== 'object') {
+                    window.__hasLocalData = false;
+                    return false;
+                }
+                state = { ...state, ...parsed };
+                window.__hasLocalData = true;
+                return true;
+            } catch (err) {
+                console.warn('[9A] Dữ liệu localStorage lỗi, bỏ qua bản local:', err);
+                window.__hasLocalData = false;
+                return false;
+            }
         }
 
-        async function saveData() { 
-            if (window.useCloud && window.cloudDb && window.cloudUser) {
+        function persistLocalData() {
+            try {
+                localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(state));
+                window.__hasLocalData = true;
+                return true;
+            } catch (err) {
+                console.error('[9A] Không thể lưu localStorage:', err);
+                return false;
+            }
+        }
+
+        function getCloudDataDocRef() {
+            if (!window.cloudDb || !window.cloudDoc || !window.cloudUser) return null;
+            // Giữ cấu trúc Firestore hiện tại để không làm hỏng Rules đang dùng.
+            // localStorage mới là lớp bảo vệ bắt buộc; Cloud tiếp tục đồng bộ theo UID Firebase hiện có.
+            return window.cloudDoc(
+                window.cloudDb,
+                'artifacts', window.cloudAppId,
+                'users', window.cloudUser.uid,
+                'classData', 'main'
+            );
+        }
+
+        // LOCAL-FIRST: mọi thay đổi luôn được ghi xuống trình duyệt trước,
+        // sau đó mới đồng bộ Firestore. Vì vậy đóng tab/đăng xuất/reload không làm mất dữ liệu local.
+        async function saveData() {
+            const now = Date.now();
+            state.__lastUpdatedAt = now;
+
+            // 1) Bắt buộc lưu local trước. Đây là bản dự phòng tức thời trên thiết bị.
+            persistLocalData();
+
+            // 2) Sau đó mới cố gắng đồng bộ Cloud.
+            if (window.useCloud && window.cloudDb && window.cloudUser && window.cloudSetDoc) {
                 try {
-                    const docRef = window.cloudDoc(window.cloudDb, 'artifacts', window.cloudAppId, 'users', window.cloudUser.uid, 'classData', 'main');
-                    await window.cloudSetDoc(docRef, { state: state });
-                } catch (e) { localStorage.setItem('chuyen_tau_data', JSON.stringify(state)); }
-            } else { localStorage.setItem('chuyen_tau_data', JSON.stringify(state)); }
+                    const docRef = getCloudDataDocRef();
+                    if (!docRef) return;
+                    await window.cloudSetDoc(docRef, {
+                        state: state,
+                        updatedAt: now
+                    }, { merge: true });
+                    window.__lastCloudSyncAt = now;
+                    window.__lastCloudSyncError = null;
+                } catch (e) {
+                    // Không được xóa/ghi đè local khi Cloud lỗi.
+                    window.__lastCloudSyncError = e;
+                    console.warn('[9A] Lưu Cloud lỗi; dữ liệu local vẫn được giữ an toàn:', e);
+                }
+            }
+        }
+
+        // Khi đóng tab/chuyển app về nền, ghi lại state hiện tại một lần nữa.
+        // Không đổi timestamp để tránh tạo xung đột giả với dữ liệu Cloud.
+        if (!window.__localPersistenceGuardsBound) {
+            window.addEventListener('pagehide', () => {
+                try {
+                    if (typeof state === 'object' && state && (window.__hasLocalData || Number(state.__lastUpdatedAt || 0) > 0)) persistLocalData();
+                } catch (_) {}
+            });
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'hidden') {
+                    try {
+                        if (typeof state === 'object' && state && (window.__hasLocalData || Number(state.__lastUpdatedAt || 0) > 0)) persistLocalData();
+                    } catch (_) {}
+                }
+            });
+            window.__localPersistenceGuardsBound = true;
         }
 
         function applyStateDefaults() {
@@ -1136,7 +1200,7 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
                 if (!s.history) s.history = [];
             });
             // Lưu lại ngay sau khi nâng cấp mã để mã của mỗi em luôn ổn định qua các lần mở app.
-            if (studentCodeMigrated) setTimeout(() => { try { saveData(); } catch (_) {} }, 0);
+            if (studentCodeMigrated && !window.__suppressAutoSaveDuringBoot) setTimeout(() => { try { saveData(); } catch (_) {} }, 0);
 
             const defaultCriteria = {
                 version: 2,
@@ -5093,20 +5157,14 @@ window.copyTextSafe = async function(text) {
     function localBootWithoutCloudOverwrite() {
         if (typeof isDataLoaded !== 'undefined' && isDataLoaded) {
             if (typeof renderLayout === 'function') renderLayout();
-            return;
+            return !!window.__hasLocalData;
         }
-        try {
-            const savedData = localStorage.getItem('chuyen_tau_data');
-            if (savedData) {
-                const parsed = JSON.parse(savedData);
-                state = { ...state, ...parsed };
-            } else {
-                initDefaultStudents();
-            }
-        } catch (err) {
-            console.warn('[9A] Dữ liệu localStorage lỗi, dùng dữ liệu mặc định:', err);
-            initDefaultStudents();
-        }
+
+        // Ưu tiên dữ liệu local đã lưu thật sự. Nếu chưa có thì chỉ dựng dữ liệu mặc định
+        // để app hiển thị; KHÔNG tự ghi đè Cloud trong lúc đang khởi động.
+        const hadLocalData = loadLocalDataIntoState();
+        if (!hadLocalData) initDefaultStudents();
+
         applyStateDefaults();
         isDataLoaded = true;
         renderLayout();
@@ -5149,32 +5207,64 @@ window.copyTextSafe = async function(text) {
             saveData();
             // Lưu ý: Không gọi renderLayout() ở đây để tránh mất focus khi đang gõ phím
         };
+
+        return hadLocalData;
     }
 
+    // Đây là startApp DUY NHẤT còn hoạt động trong file.
     window.startApp = function safeStartApp() {
-        // Không chờ Firestore mới cho người dùng vào app.
-        localBootWithoutCloudOverwrite();
+        // Chặn các migration tự động save trong vài mili-giây đầu để dữ liệu mẫu
+        // không có cơ hội ghi đè dữ liệu Cloud trước khi Cloud phản hồi.
+        window.__suppressAutoSaveDuringBoot = true;
+        const hadLocalData = localBootWithoutCloudOverwrite();
+        window.__suppressAutoSaveDuringBoot = false;
 
         if (!window.useCloud || !window.cloudDb || !window.cloudUser || cloudSubscribed) return;
         cloudSubscribed = true;
+
         try {
-            const docRef = window.cloudDoc(window.cloudDb, 'artifacts', window.cloudAppId, 'users', window.cloudUser.uid, 'classData', 'main');
+            const docRef = getCloudDataDocRef();
+            if (!docRef) return;
+
             window.cloudOnSnapshot(docRef, async (docSnap) => {
                 try {
-                    if (docSnap.exists()) {
-                        const remoteState = docSnap.data() && docSnap.data().state;
-                        if (remoteState && typeof remoteState === 'object') {
-                            state = { ...state, ...remoteState };
-                            applyStateDefaults();
-                            isDataLoaded = true;
-                            renderLayout();
-                        }
-                    } else {
-                        // Chỉ tạo Cloud document khi chắc chắn document chưa tồn tại.
+                    if (!docSnap.exists()) {
+                        // Cloud chưa có dữ liệu: chỉ lúc này mới đưa state hiện tại lên Cloud.
+                        await saveData();
+                        return;
+                    }
+
+                    const payload = docSnap.data() || {};
+                    const remoteState = payload.state;
+                    if (!remoteState || typeof remoteState !== 'object') return;
+
+                    const remoteTs = Number(payload.updatedAt || remoteState.__lastUpdatedAt || 0);
+                    const localTs = Number(state.__lastUpdatedAt || 0);
+                    const hasLocal = !!window.__hasLocalData;
+
+                    // Quy tắc chống ghi đè:
+                    // - Không có local thật sự -> Cloud thắng.
+                    // - Cloud có timestamp mới hơn -> Cloud thắng.
+                    // - Local mới hơn -> giữ local và đẩy local lên Cloud.
+                    // - Cả hai là dữ liệu cũ chưa có timestamp -> ưu tiên local để tránh mất dữ liệu đã nhập.
+                    const shouldUseRemote = !hasLocal || remoteTs > localTs;
+
+                    if (shouldUseRemote) {
+                        window.__suppressAutoSaveDuringBoot = true;
+                        state = { ...state, ...remoteState };
+                        applyStateDefaults();
+                        window.__suppressAutoSaveDuringBoot = false;
+
+                        isDataLoaded = true;
+                        persistLocalData(); // Cloud tải được thì cập nhật cache local ngay.
+                        renderLayout();
+                    } else if (localTs > remoteTs || (hasLocal && localTs === 0 && remoteTs === 0)) {
+                        // Nâng dữ liệu local cũ lên định dạng có timestamp và đồng bộ lại Cloud.
                         await saveData();
                     }
                 } catch (syncErr) {
-                    console.warn('[9A] Lỗi áp dụng dữ liệu Cloud:', syncErr);
+                    window.__suppressAutoSaveDuringBoot = false;
+                    console.warn('[9A] Lỗi áp dụng dữ liệu Cloud; tiếp tục dùng local:', syncErr);
                 }
             }, (error) => {
                 console.warn('[9A] Firestore snapshot lỗi, tiếp tục dùng dữ liệu cục bộ:', error);
@@ -6977,21 +7067,396 @@ window.tkbExportPdf = function() {
 
   function selectedDate(){return state.pointsForm?.date||getTodayString();}
   function dayLock(date){authEnsureDefaults();if(!state.dailyScoringLocks[date])state.dailyScoringLocks[date]={status:'open'};return state.dailyScoringLocks[date];}
-  function lockStatusLabel(l){return l.status==='approved'?'Đã được GVCN duyệt & khóa':l.status==='submitted'?'BCS đã hoàn tất – chờ GVCN duyệt':'Đang mở chấm điểm';}
-  function dayEntries(date){return (state.students||[]).flatMap(s=>(s.history||[]).filter(h=>String(h.date||'').slice(0,10)===date&&h.enteredByAccountId).map(h=>({...h,studentName:s.name})));}
-  window.authSubmitScoringDay=async function(){const a=currentAccount();if(!a||a.role!=='bcs')return;const d=selectedDate(),l=dayLock(d);if(l.status!=='open')return showToast('Ngày này đã được khóa.','error');l.status='submitted';l.submittedBy=a.id;l.submittedByName=a.displayName;l.submittedAt=nowISO();auditPush('workflow','BCS Hoàn tất & Khóa ngày',`Ngày ${formatDateForDisplay(d)}`,'success',a);await saveData();renderLayout();showToast('Đã Hoàn tất & Khóa ngày. Chờ GVCN duyệt.','success');};
-  window.authApproveScoringDay=async function(){const a=currentAccount();if(!a||a.role!=='gvcn')return;const d=selectedDate(),l=dayLock(d);l.status='approved';l.approvedBy=a.id;l.approvedByName=a.displayName;l.approvedAt=nowISO();auditPush('workflow','GVCN Duyệt & Khóa ngày',`Ngày ${formatDateForDisplay(d)}`,'success',a);await saveData();renderLayout();showToast('GVCN đã duyệt và khóa ngày '+formatDateForDisplay(d)+'.','success');};
-  window.authReopenScoringDay=async function(){const a=currentAccount();if(!a||a.role!=='gvcn')return;const d=selectedDate(),l=dayLock(d);if(!confirm('Mở lại ngày '+formatDateForDisplay(d)+' cho BCS chỉnh sửa?'))return;l.status='open';l.reopenedAt=nowISO();l.reopenedBy=a.id;auditPush('workflow','GVCN Mở lại ngày',`Ngày ${formatDateForDisplay(d)} cho BCS chỉnh sửa`,'success',a);await saveData();renderLayout();showToast('Đã mở lại ngày cho BCS.','success');};
+  function lockStatusLabel(l){return l.status==='approved'?'Đã được GVCN duyệt & khóa':l.status==='submitted'?'BCS đã nộp – chờ GVCN phê duyệt':'Đang mở chấm điểm';}
+  function dayEntries(date){const dStr=String(date||'').slice(0,10);return (state.students||[]).flatMap(s=>(s.history||[]).filter(h=>String(h.date||'').slice(0,10)===dStr).map(h=>({...h,studentId:s.id,studentName:s.name,studentGroup:s.group||'Chưa xếp tổ'}))).sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));}
+
+  window.authSubmitScoringDay=async function(customDate){
+    const a=currentAccount();
+    if(!a||a.role!=='bcs')return showToast('Chức năng này dành cho Ban cán sự lớp.','error');
+    const d=customDate||selectedDate(),l=dayLock(d),entries=dayEntries(d);
+    if(l.status!=='open')return showToast('Ngày này đã được gửi hoặc đã khóa.','error');
+    if(!confirm(`Xác nhận Hoàn tất & Khóa ngày ${formatDateForDisplay(d)}?\n\n• Đã ghi nhận: ${entries.length} lượt chấm điểm.\n• Sau khi nộp, Ban cán sự sẽ không thể chỉnh sửa thêm và hệ thống sẽ chuyển đến GVCN để phê duyệt.`))return;
+    l.status='submitted';l.submittedBy=a.id;l.submittedByName=a.displayName||roleLabel(a);l.submittedAt=nowISO();l.entryCount=entries.length;
+    auditPush('workflow','BCS Hoàn tất & Khóa ngày',`Ngày ${formatDateForDisplay(d)} • ${entries.length} lượt chấm`,'success',a);
+    await saveData();closeModal('scoring-review');renderLayout();
+    showToast(`Đã Hoàn tất & Khóa ngày ${formatDateForDisplay(d)}. Chờ GVCN phê duyệt.`,'success');
+  };
+
+  window.authApproveScoringDay=async function(customDate){
+    const a=currentAccount();
+    if(a&&a.role!=='gvcn')return showToast('Chỉ Giáo viên chủ nhiệm mới có quyền Phê duyệt & Khóa ngày.','error');
+    const d=customDate||selectedDate(),l=dayLock(d),entries=dayEntries(d);
+    if(l.status==='approved')return showToast('Ngày này đã được GVCN duyệt trước đó.','info');
+    if(!confirm(`Xác nhận Phê duyệt & Khóa ngày ${formatDateForDisplay(d)}?\n\n• Tổng số lượt chấm: ${entries.length} lượt.\n• Sau khi duyệt, toàn bộ điểm số của ngày này sẽ được chốt an toàn và bảo vệ.`))return;
+    l.status='approved';l.approvedBy=a?a.id:'gvcn';l.approvedByName=a?a.displayName:(state.admin?.name||'Giáo viên chủ nhiệm');l.approvedAt=nowISO();l.entryCount=entries.length;
+    auditPush('workflow','GVCN Duyệt & Khóa ngày',`Ngày ${formatDateForDisplay(d)} • ${entries.length} lượt chấm`,'success',a||{role:'gvcn',displayName:state.admin?.name||'GVCN'});
+    await saveData();closeModal('scoring-review');renderLayout();
+    showToast(`GVCN đã Phê duyệt & Khóa ngày ${formatDateForDisplay(d)} thành công!`,'success');
+  };
+
+  window.authReopenScoringDay=async function(customDate){
+    const a=currentAccount();
+    if(a&&a.role!=='gvcn')return showToast('Chỉ GVCN mới có quyền mở lại ngày chấm điểm.','error');
+    const d=customDate||selectedDate(),l=dayLock(d);
+    if(!confirm(`Mở lại ngày ${formatDateForDisplay(d)} cho Ban cán sự lớp?\n\nSau khi mở, Ban cán sự có thể tiếp tục bổ sung hoặc chỉnh sửa điểm của ngày này.`))return;
+    l.status='open';l.reopenedAt=nowISO();l.reopenedBy=a?a.id:'gvcn';l.reopenedByName=a?a.displayName:(state.admin?.name||'Giáo viên chủ nhiệm');
+    auditPush('workflow','GVCN Mở lại ngày',`Mở lại ngày ${formatDateForDisplay(d)} cho BCS`,'success',a||{role:'gvcn',displayName:state.admin?.name||'GVCN'});
+    await saveData();closeModal('scoring-review');renderLayout();
+    showToast(`Đã mở lại ngày ${formatDateForDisplay(d)} cho Ban cán sự.`,'success');
+  };
+
+  window.openScoringDayReviewModal=function(targetDate){
+    const d=targetDate||selectedDate(),l=dayLock(d),entries=dayEntries(d),a=currentAccount();
+    const isGVCN=!a||a.role==='gvcn',isBCS=a&&a.role==='bcs';
+    const posPoints=entries.filter(e=>Number(e.points)>0).reduce((s,e)=>s+Number(e.points),0);
+    const negPoints=entries.filter(e=>Number(e.points)<0).reduce((s,e)=>s+Number(e.points),0);
+    const netPoints=posPoints+negPoints;
+    const studentCount=new Set(entries.map(e=>e.studentId)).size;
+    const badgeClass=l.status==='approved'?'bg-indigo-100 text-indigo-800 border-indigo-200':l.status==='submitted'?'bg-amber-100 text-amber-800 border-amber-200':'bg-emerald-100 text-emerald-800 border-emerald-200';
+    const badgeIcon=l.status==='approved'?'ph-seal-check':l.status==='submitted'?'ph-hourglass-high':'ph-pencil-line';
+    const rowsHtml=entries.length?entries.map((e,idx)=>{
+      const isPos=Number(e.points)>=0;
+      const cleanReason=esc(String(e.reason||'').replace(/\s*\[[^\]]+\]\s*$/,''));
+      const timeStr=e.date?new Date(e.date).toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'}):'—';
+      const actor=esc(e.enteredByName||(e.enteredByRole?e.enteredByRole:'BCS/GVCN'));
+      return `<tr class="border-b border-slate-100 hover:bg-slate-50/80 transition-colors">
+        <td class="p-3 text-center text-xs font-black text-slate-400">${idx+1}</td>
+        <td class="p-3">
+          <div class="font-black text-xs text-slate-800">${esc(e.studentName)}</div>
+          <div class="text-[10px] font-bold text-slate-400">${esc(e.studentGroup)}</div>
+        </td>
+        <td class="p-3 text-xs"><span class="px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 font-bold text-[10px]">${esc(e.category||'Khác')}</span></td>
+        <td class="p-3 text-center">
+          <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-black ${isPos?'bg-emerald-50 text-emerald-700 border border-emerald-200':'bg-rose-50 text-rose-700 border border-rose-200'}">
+            ${isPos?'+':''}${e.points}đ
+          </span>
+        </td>
+        <td class="p-3">
+          <div class="text-xs font-bold text-slate-700">${cleanReason}</div>
+          ${e.note?`<div class="text-[10px] italic text-slate-400 mt-0.5">Ghi chú: ${esc(e.note)}</div>`:''}
+        </td>
+        <td class="p-3 whitespace-nowrap text-right">
+          <div class="text-[11px] font-black text-slate-700">${actor}</div>
+          <div class="text-[9px] text-slate-400">${timeStr}</div>
+        </td>
+      </tr>`;
+    }).join(''):`<tr><td colspan="6" class="p-12 text-center text-slate-400 font-bold text-sm">Chưa có lượt chấm điểm nào được ghi nhận trong ngày ${formatDateForDisplay(d)}.</td></tr>`;
+
+    const modalHtml=`<div class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3 md:p-5 animate-fade-in">
+      <div class="bg-white w-full max-w-4xl max-h-[92vh] rounded-[2rem] shadow-2xl flex flex-col overflow-hidden border border-slate-100">
+        <div class="bg-gradient-to-r from-[#233D4D] via-[#215E61] to-[#4338ca] text-white p-5 md:p-6 flex items-center justify-between">
+          <div class="flex items-center gap-3">
+            <div class="w-12 h-12 rounded-2xl bg-white/10 border border-white/20 flex items-center justify-center shadow-inner">
+              <i class="ph-fill ph-list-checks text-2xl text-yellow-300"></i>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <h3 class="font-black text-lg md:text-xl">Bảng kê chấm điểm ngày ${formatDateForDisplay(d)}</h3>
+                <span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-black border ${badgeClass}">
+                  <i class="ph-fill ${badgeIcon}"></i> ${lockStatusLabel(l)}
+                </span>
+              </div>
+              <div class="text-xs text-indigo-100/80 mt-1">
+                ${l.submittedByName?`Nộp bởi: <b>${esc(l.submittedByName)}</b> (${l.submittedAt?new Date(l.submittedAt).toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'}):''}) • `:''}
+                ${l.approvedByName?`Duyệt bởi GVCN: <b>${esc(l.approvedByName)}</b>`:''}
+              </div>
+            </div>
+          </div>
+          <button onclick="closeModal('scoring-review')" class="w-10 h-10 rounded-2xl bg-white/10 hover:bg-white/20 text-white flex items-center justify-center text-lg transition-colors">
+            <i class="ph-bold ph-x"></i>
+          </button>
+        </div>
+
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 p-4 bg-slate-50 border-b border-slate-200/80">
+          <div class="bg-white p-3 rounded-2xl border border-slate-200/60 shadow-sm text-center">
+            <div class="text-[10px] font-black text-slate-400 uppercase tracking-wider">Tổng lượt chấm</div>
+            <div class="text-xl font-black text-slate-800 mt-0.5">${entries.length}</div>
+          </div>
+          <div class="bg-white p-3 rounded-2xl border border-slate-200/60 shadow-sm text-center">
+            <div class="text-[10px] font-black text-emerald-500 uppercase tracking-wider">Tổng điểm thưởng</div>
+            <div class="text-xl font-black text-emerald-600 mt-0.5">+${posPoints}đ</div>
+          </div>
+          <div class="bg-white p-3 rounded-2xl border border-slate-200/60 shadow-sm text-center">
+            <div class="text-[10px] font-black text-rose-500 uppercase tracking-wider">Tổng điểm phạt</div>
+            <div class="text-xl font-black text-rose-600 mt-0.5">${negPoints}đ</div>
+          </div>
+          <div class="bg-white p-3 rounded-2xl border border-slate-200/60 shadow-sm text-center">
+            <div class="text-[10px] font-black text-indigo-500 uppercase tracking-wider">Số học sinh được ghi</div>
+            <div class="text-xl font-black text-indigo-600 mt-0.5">${studentCount} HS</div>
+          </div>
+        </div>
+
+        <div class="flex-1 overflow-y-auto custom-scrollbar p-2 md:p-4">
+          <table class="w-full text-left border-collapse">
+            <thead class="sticky top-0 bg-white/95 backdrop-blur-sm shadow-sm z-10">
+              <tr class="text-[10px] uppercase font-black text-slate-400 border-b border-slate-200">
+                <th class="p-3 text-center w-12">STT</th>
+                <th class="p-3">Học sinh / Tổ</th>
+                <th class="p-3">Phân loại</th>
+                <th class="p-3 text-center">Điểm</th>
+                <th class="p-3">Lý do & Nội dung</th>
+                <th class="p-3 text-right">Người chấm & Giờ</th>
+              </tr>
+            </thead>
+            <tbody>${rowsHtml}</tbody>
+          </table>
+        </div>
+
+        <div class="p-4 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-3">
+          <div class="flex items-center gap-2">
+            <button onclick="printScoringDayLedger('${d}')" class="px-4 py-2.5 rounded-xl border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 font-bold text-xs shadow-sm flex items-center gap-1.5">
+              <i class="ph-bold ph-printer text-base"></i> In bảng kê
+            </button>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            ${isGVCN && l.status !== 'approved' ? `
+              <button onclick="authApproveScoringDay('${d}')" class="px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white font-black text-xs shadow-md flex items-center gap-1.5">
+                <i class="ph-bold ph-seal-check text-base"></i> Duyệt & Khóa ngày
+              </button>
+            ` : ''}
+            ${isGVCN && l.status !== 'open' ? `
+              <button onclick="authReopenScoringDay('${d}')" class="px-4 py-2.5 rounded-xl bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-bold text-xs shadow-sm flex items-center gap-1.5">
+                <i class="ph-bold ph-lock-key-open text-base"></i> Mở lại cho BCS
+              </button>
+            ` : ''}
+            ${isBCS && l.status === 'open' ? `
+              <button onclick="authSubmitScoringDay('${d}')" class="px-5 py-2.5 rounded-xl bg-slate-900 hover:bg-black text-white font-black text-xs shadow-md flex items-center gap-1.5">
+                <i class="ph-bold ph-paper-plane-tilt text-base"></i> Hoàn tất & Gửi GVCN duyệt
+              </button>
+            ` : ''}
+            <button onclick="closeModal('scoring-review')" class="px-5 py-2.5 rounded-xl bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-xs">
+              Đóng
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+    const host=document.getElementById('modal-container');
+    if(host){host.innerHTML=modalHtml;document.body.classList.add('modal-open');}
+  };
+
+  window.openScoringDayLocksListModal=function(){
+    authEnsureDefaults();
+    const locks=state.dailyScoringLocks||{};
+    const allDates=new Set([...Object.keys(locks)]);
+    (state.students||[]).forEach(s=>(s.history||[]).forEach(h=>{if(h.date)allDates.add(String(h.date).slice(0,10));}));
+    const sortedDates=[...allDates].filter(d=>/^\d{4}-\d{2}-\d{2}$/.test(d)).sort((a,b)=>b.localeCompare(a));
+    const pendingList=sortedDates.filter(d=>dayLock(d).status==='submitted');
+    const a=currentAccount();const isGVCN=!a||a.role==='gvcn';
+
+    const rows=sortedDates.length?sortedDates.map((d,idx)=>{
+      const l=dayLock(d),entries=dayEntries(d);
+      const isPending=l.status==='submitted',isApproved=l.status==='approved';
+      const badgeCls=isApproved?'bg-indigo-50 text-indigo-700 border-indigo-200':isPending?'bg-amber-50 text-amber-700 border-amber-200':'bg-emerald-50 text-emerald-700 border-emerald-200';
+      return `<tr class="border-b border-slate-100 hover:bg-slate-50 transition-colors">
+        <td class="p-3 text-center text-xs font-black text-slate-400">${idx+1}</td>
+        <td class="p-3 font-black text-xs text-slate-800">${formatDateForDisplay(d)}</td>
+        <td class="p-3"><span class="inline-flex px-2.5 py-1 rounded-lg text-[10px] font-black border ${badgeCls}">${lockStatusLabel(l)}</span></td>
+        <td class="p-3 text-center text-xs font-bold text-slate-700">${entries.length} lượt</td>
+        <td class="p-3 text-xs text-slate-500">
+          ${l.submittedByName?`BCS: <b>${esc(l.submittedByName)}</b>`:''}
+          ${l.approvedByName?` • GVCN: <b>${esc(l.approvedByName)}</b>`:''}
+        </td>
+        <td class="p-3 text-right">
+          <div class="flex items-center justify-end gap-1.5">
+            <button onclick="updatePointsForm('date','${d}');openScoringDayReviewModal('${d}');" class="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-bold">
+              Xem chi tiết
+            </button>
+            ${isGVCN && isPending ? `
+              <button onclick="authApproveScoringDay('${d}')" class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-black shadow-sm">
+                Duyệt ngay
+              </button>
+            ` : ''}
+          </div>
+        </td>
+      </tr>`;
+    }).join(''):`<tr><td colspan="6" class="p-10 text-center text-slate-400 text-sm">Chưa có lịch sử khóa ngày nào.</td></tr>`;
+
+    const modalHtml=`<div class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3 md:p-5 animate-fade-in">
+      <div class="bg-white w-full max-w-3xl max-h-[85vh] rounded-[2rem] shadow-2xl flex flex-col overflow-hidden border border-slate-100">
+        <div class="bg-gradient-to-r from-[#233D4D] to-[#215E61] text-white p-5 flex items-center justify-between">
+          <div class="flex items-center gap-3">
+            <div class="w-10 h-10 rounded-xl bg-white/10 flex items-center justify-center"><i class="ph-fill ph-calendar-check text-xl text-yellow-300"></i></div>
+            <div>
+              <h3 class="font-black text-lg">Quản lý duyệt & Khóa ngày chấm điểm</h3>
+              <p class="text-xs text-emerald-100/80">Theo dõi tiến độ chấm điểm của Ban cán sự và lịch sử phê duyệt của GVCN</p>
+            </div>
+          </div>
+          <button onclick="closeModal('scoring-locks')" class="w-9 h-9 rounded-xl bg-white/10 hover:bg-white/20 text-white flex items-center justify-center"><i class="ph-bold ph-x"></i></button>
+        </div>
+        <div class="p-3 bg-amber-50 border-b border-amber-100 flex items-center justify-between text-xs font-bold text-amber-800">
+          <span>Có <b>${pendingList.length}</b> ngày Ban cán sự đã nộp đang chờ GVCN phê duyệt.</span>
+        </div>
+        <div class="flex-1 overflow-y-auto custom-scrollbar p-3">
+          <table class="w-full text-left border-collapse">
+            <thead>
+              <tr class="text-[10px] uppercase font-black text-slate-400 border-b">
+                <th class="p-3 text-center w-12">STT</th>
+                <th class="p-3">Ngày</th>
+                <th class="p-3">Trạng thái</th>
+                <th class="p-3 text-center">Số lượt</th>
+                <th class="p-3">Ghi nhận</th>
+                <th class="p-3 text-right">Thao tác</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <div class="p-4 bg-slate-50 border-t flex justify-end">
+          <button onclick="closeModal('scoring-locks')" class="px-5 py-2.5 rounded-xl bg-slate-200 hover:bg-slate-300 font-bold text-xs">Đóng</button>
+        </div>
+      </div>
+    </div>`;
+    const host=document.getElementById('modal-container');
+    if(host){host.innerHTML=modalHtml;document.body.classList.add('modal-open');}
+  };
+
+  window.printScoringDayLedger=function(date){
+    const d=date||selectedDate(),l=dayLock(d),entries=dayEntries(d);
+    const posPoints=entries.filter(e=>Number(e.points)>0).reduce((s,e)=>s+Number(e.points),0);
+    const negPoints=entries.filter(e=>Number(e.points)<0).reduce((s,e)=>s+Number(e.points),0);
+    const w=window.open('','_blank');
+    if(!w)return showToast('Trình duyệt chặn mở cửa sổ in.','error');
+    const tableRows=entries.map((e,i)=>`<tr>
+      <td style="text-align:center;padding:6px;border:1px solid #ccc;">${i+1}</td>
+      <td style="padding:6px;border:1px solid #ccc;font-weight:bold;">${esc(e.studentName)} (${esc(e.studentGroup)})</td>
+      <td style="padding:6px;border:1px solid #ccc;">${esc(e.category||'Khác')}</td>
+      <td style="text-align:center;padding:6px;border:1px solid #ccc;font-weight:bold;color:${Number(e.points)>=0?'#047857':'#b91c1c'};">${Number(e.points)>=0?'+':''}${e.points}đ</td>
+      <td style="padding:6px;border:1px solid #ccc;">${esc(e.reason||'')}${e.note?` <i>(${esc(e.note)})</i>`:''}</td>
+      <td style="padding:6px;border:1px solid #ccc;font-size:11px;">${esc(e.enteredByName||'BCS')}</td>
+    </tr>`).join('');
+    w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Bảng kê chấm điểm ${formatDateForDisplay(d)}</title>
+      <style>body{font-family:sans-serif;padding:24px;color:#1e293b;}table{width:100%;border-collapse:collapse;margin-top:16px;}th{background:#f1f5f9;padding:8px;border:1px solid #ccc;font-size:12px;}td{font-size:12px;}.grid{display:flex;justify-content:space-between;margin-top:40px;text-align:center;}</style>
+    </head><body>
+      <div style="text-align:center;">
+        <h3 style="margin:0;text-transform:uppercase;">TRƯỜNG ${esc(state.admin?.schoolName||'TRƯỜNG HỌC')} - LỚP ${esc(state.admin?.className||'')}</h3>
+        <h2 style="margin:8px 0 4px 0;">BẢNG KÊ CHI TIẾT CHẤM ĐIỂM THI ĐUA</h2>
+        <p style="margin:0;font-size:14px;color:#64748b;">Ngày: <b>${formatDateForDisplay(d)}</b> • Trạng thái: <b>${lockStatusLabel(l)}</b></p>
+        <p style="margin:4px 0 0 0;font-size:12px;">Tổng số: <b>${entries.length}</b> lượt • Thưởng: <b style="color:#047857;">+${posPoints}đ</b> • Phạt: <b style="color:#b91c1c;">${negPoints}đ</b></p>
+      </div>
+      <table>
+        <thead><tr><th style="width:36px;">STT</th><th>Học sinh / Tổ</th><th>Phân loại</th><th style="width:60px;">Điểm</th><th>Nội dung / Lý do</th><th>Người ghi</th></tr></thead>
+        <tbody>${tableRows||'<tr><td colspan="6" style="text-align:center;padding:20px;">Không có lượt chấm điểm nào.</td></tr>'}</tbody>
+      </table>
+      <div class="grid">
+        <div style="flex:1;"><b>ĐẠI DIỆN BAN CÁN SỰ LỚP</b><br><br><br><br><b>${esc(l.submittedByName||'....................................')}</b></div>
+        <div style="flex:1;"><b>GIÁO VIÊN CHỦ NHIỆM DUYỆT</b><br><br><br><br><b>${esc(l.approvedByName||state.admin?.name||'....................................')}</b></div>
+      </div>
+      <script>window.onload=function(){window.print();};<\/script>
+    </body></html>`);
+    w.document.close();
+  };
 
   const origRenderPoints=renderViewTichDiem;
   renderViewTichDiem=function(){
-    const base=origRenderPoints();const a=currentAccount();if(!a)return base;const d=selectedDate(),l=dayLock(d),entries=dayEntries(d);const cls=l.status==='approved'?'auth-lock-approved':l.status==='submitted'?'auth-lock-submitted':'auth-lock-open';
+    const base=origRenderPoints();
+    const a=currentAccount();
+    const d=selectedDate(),l=dayLock(d),entries=dayEntries(d);
+    const isGVCN=!a||a.role==='gvcn';
+    const isBCS=a&&a.role==='bcs';
+    const pendingLocks=Object.values(state.dailyScoringLocks||{}).filter(x=>x&&x.status==='submitted').length;
+    const posPoints=entries.filter(e=>Number(e.points)>0).reduce((s,e)=>s+Number(e.points),0);
+    const negPoints=entries.filter(e=>Number(e.points)<0).reduce((s,e)=>s+Number(e.points),0);
+
+    let cls='border-emerald-200 bg-gradient-to-br from-emerald-50/90 via-emerald-50/40 to-teal-50/50 text-emerald-950';
+    let icon='ph-pencil-line text-emerald-600 bg-emerald-100';
+    let statusText='🟢 Đang mở chấm điểm';
+
+    if(l.status==='approved'){
+      cls='border-indigo-200 bg-gradient-to-br from-indigo-50/90 via-indigo-50/40 to-blue-50/50 text-indigo-950';
+      icon='ph-seal-check text-indigo-600 bg-indigo-100';
+      statusText='🔵 Đã được GVCN duyệt & khóa an toàn';
+    }else if(l.status==='submitted'){
+      cls='border-amber-300 bg-gradient-to-br from-amber-50 via-amber-50/60 to-orange-50/50 text-amber-950 shadow-md ring-2 ring-amber-300/40';
+      icon='ph-hourglass-high text-amber-600 bg-amber-100 animate-pulse';
+      statusText='🟡 BCS đã nộp – Chờ GVCN phê duyệt & khóa ngày';
+    }
+
     let actions='';
-    if(a.role==='bcs') actions=l.status==='open'?`<button onclick="authSubmitScoringDay()" class="px-4 py-2.5 rounded-xl bg-slate-900 text-white font-black text-xs shadow-md"><i class="ph-bold ph-lock-key mr-1"></i> Hoàn tất & Khóa ngày</button>`:`<span class="text-xs font-bold opacity-70"><i class="ph-fill ph-lock-key"></i> BCS không thể chỉnh sửa ngày này</span>`;
-    if(a.role==='gvcn') actions=`${l.status==='submitted'?`<button onclick="authApproveScoringDay()" class="px-4 py-2.5 rounded-xl bg-indigo-600 text-white font-black text-xs shadow-md"><i class="ph-bold ph-seal-check mr-1"></i> Duyệt & Khóa</button>`:''}${l.status!=='open'?`<button onclick="authReopenScoringDay()" class="px-4 py-2.5 rounded-xl bg-white border border-slate-300 text-slate-700 font-black text-xs"><i class="ph-bold ph-lock-key-open mr-1"></i> Mở lại cho BCS</button>`:''}`;
-    const bar=`<div class="max-w-7xl mx-auto mb-4 rounded-2xl border p-4 ${cls}"><div class="flex flex-col lg:flex-row lg:items-center gap-3 justify-between"><div class="flex items-start gap-3"><div class="w-10 h-10 rounded-xl bg-white/80 flex items-center justify-center shadow-sm"><i class="ph-fill ${l.status==='approved'?'ph-seal-check':l.status==='submitted'?'ph-hourglass-high':'ph-pencil-simple'} text-xl"></i></div><div><div class="font-black text-sm">Quy trình chấm điểm ngày ${formatDateForDisplay(d)}</div><div class="mt-1 text-xs font-bold opacity-75">${lockStatusLabel(l)} • ${entries.length} lượt do BCS nhập${l.submittedByName?' • Hoàn tất bởi '+esc(l.submittedByName):''}</div></div></div><div class="flex flex-wrap gap-2 items-center">${actions}</div></div></div>`;
+    if(isGVCN){
+      actions=`
+        ${l.status==='submitted'?`
+          <button onclick="authApproveScoringDay('${d}')" class="px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white font-black text-xs shadow-lg transform hover:-translate-y-0.5 transition-all flex items-center gap-1.5">
+            <i class="ph-bold ph-seal-check text-base"></i> Duyệt & Khóa ngày
+          </button>
+        `:''}
+        ${l.status==='open'?`
+          <button onclick="authApproveScoringDay('${d}')" class="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-black text-xs shadow flex items-center gap-1.5">
+            <i class="ph-bold ph-lock-key text-base"></i> Khóa & Duyệt ngày này
+          </button>
+        `:''}
+        <button onclick="openScoringDayReviewModal('${d}')" class="px-4 py-2.5 rounded-xl bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 font-bold text-xs shadow-sm flex items-center gap-1.5">
+          <i class="ph-bold ph-list-checks text-base text-indigo-600"></i> Bảng kê điểm (${entries.length})
+        </button>
+        ${l.status!=='open'?`
+          <button onclick="authReopenScoringDay('${d}')" class="px-3.5 py-2.5 rounded-xl bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-bold text-xs shadow-sm flex items-center gap-1.5" title="Mở lại ngày cho Ban cán sự sửa">
+            <i class="ph-bold ph-lock-key-open text-base text-slate-500"></i> Mở lại cho BCS
+          </button>
+        `:''}
+        <button onclick="openScoringDayLocksListModal()" class="px-3.5 py-2.5 rounded-xl bg-slate-900/10 hover:bg-slate-900/20 text-slate-800 font-black text-xs flex items-center gap-1.5">
+          <i class="ph-bold ph-calendar-check text-base"></i> Quản lý khóa ngày ${pendingLocks?`<span class="bg-amber-500 text-white px-1.5 py-0.5 rounded-full text-[10px] font-black">${pendingLocks}</span>`:''}
+        </button>
+      `;
+    }else if(isBCS){
+      actions=`
+        ${l.status==='open'?`
+          <button onclick="authSubmitScoringDay('${d}')" class="px-5 py-2.5 rounded-xl bg-slate-900 hover:bg-black text-white font-black text-xs shadow-lg flex items-center gap-1.5 transform hover:-translate-y-0.5 transition-all">
+            <i class="ph-bold ph-paper-plane-tilt text-base text-yellow-300"></i> Hoàn tất & Khóa ngày gửi GVCN
+          </button>
+        `:`
+          <span class="px-3.5 py-2 rounded-xl ${l.status==='approved'?'bg-indigo-100 text-indigo-800':'bg-amber-100 text-amber-800'} font-black text-xs flex items-center gap-1.5">
+            <i class="ph-fill ${l.status==='approved'?'ph-seal-check':'ph-lock-key'}"></i> ${l.status==='approved'?'GVCN đã duyệt & khóa ngày này':'BCS đã nộp – đang chờ GVCN duyệt'}
+          </span>
+        `}
+        <button onclick="openScoringDayReviewModal('${d}')" class="px-4 py-2.5 rounded-xl bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 font-bold text-xs shadow-sm flex items-center gap-1.5">
+          <i class="ph-bold ph-list-checks text-base text-indigo-600"></i> Xem điểm đã nhập (${entries.length})
+        </button>
+      `;
+    }else{
+      actions=`
+        <button onclick="openScoringDayReviewModal('${d}')" class="px-4 py-2.5 rounded-xl bg-white border border-slate-300 hover:bg-slate-50 text-slate-800 font-bold text-xs shadow-sm flex items-center gap-1.5">
+          <i class="ph-bold ph-list-checks text-base text-indigo-600"></i> Xem bảng kê (${entries.length})
+        </button>
+      `;
+    }
+
+    const lockedNotice=isBCS && l.status!=='open'?`
+      <div class="mt-3 p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl flex items-center gap-2 text-xs font-bold text-amber-900">
+        <i class="ph-fill ph-lock-key text-base text-amber-600"></i>
+        <span>Ngày ${formatDateForDisplay(d)} đã được ${l.status==='approved'?'GVCN phê duyệt & khóa':'nộp cho GVCN'}. Ban cán sự không thể chỉnh sửa thêm điểm.</span>
+      </div>
+    `:'';
+
+    const bar=`
+      <div class="max-w-2xl mx-auto mb-5 rounded-[1.8rem] border p-4 md:p-5 ${cls} shadow-sm animate-fade-in">
+        <div class="flex flex-col sm:flex-row sm:items-center gap-4 justify-between">
+          <div class="flex items-start gap-3.5">
+            <div class="w-12 h-12 rounded-2xl flex items-center justify-center shadow-sm shrink-0 ${icon}">
+              <i class="ph-fill ${icon.split(' ')[0]} text-2xl"></i>
+            </div>
+            <div>
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="font-black text-sm md:text-base">${statusText}</span>
+              </div>
+              <div class="text-xs font-bold opacity-80 mt-1">
+                Ngày: <b class="underline">${formatDateForDisplay(d)}</b> • <b>${entries.length}</b> lượt chấm (+${posPoints}đ / ${negPoints}đ)
+                ${l.submittedByName?` • BCS: <b>${esc(l.submittedByName)}</b>`:''}
+                ${l.approvedByName?` • GVCN: <b>${esc(l.approvedByName)}</b>`:''}
+              </div>
+            </div>
+          </div>
+          <div class="flex flex-wrap gap-2 items-center justify-start sm:justify-end shrink-0">
+            ${actions}
+          </div>
+        </div>
+        ${lockedNotice}
+      </div>
+    `;
+
     return bar+base;
-  };window.renderViewTichDiem=renderViewTichDiem;
+  };
+  window.renderViewTichDiem=renderViewTichDiem;
 
   const origExecutePoints=window.executePointsSubmission;
   window.executePointsSubmission=function(){
