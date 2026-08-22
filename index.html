@@ -1075,6 +1075,11 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
         // Giữ nguyên key cũ để toàn bộ dữ liệu đã lưu trước đây vẫn tương thích.
         const LOCAL_STORAGE_KEY = 'chuyen_tau_data';
 
+        // Cờ an toàn Cloud: không cho dữ liệu local cũ ghi đè Firestore trước khi
+        // snapshot đầu tiên của kho dữ liệu dùng chung được tải xong.
+        window.__cloudInitialSnapshotReady = false;
+        window.__cloudWritePending = false;
+
         function loadLocalDataIntoState() {
             try {
                 const savedData = localStorage.getItem(LOCAL_STORAGE_KEY);
@@ -1108,14 +1113,17 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
             }
         }
 
+        // ID Cloud CỐ ĐỊNH của lớp. Không phụ thuộc Firebase Anonymous UID.
+        // Nhờ vậy mọi máy tính/điện thoại và mọi tài khoản nội bộ trong app
+        // đều đọc/ghi CÙNG MỘT document Firestore.
+        const SHARED_CLOUD_NAMESPACE = 'sotayGVCN-shared-main-v1';
+
         function getCloudDataDocRef() {
             if (!window.cloudDb || !window.cloudDoc || !window.cloudUser) return null;
-            // Giữ cấu trúc Firestore hiện tại để không làm hỏng Rules đang dùng.
-            // localStorage mới là lớp bảo vệ bắt buộc; Cloud tiếp tục đồng bộ theo UID Firebase hiện có.
             return window.cloudDoc(
                 window.cloudDb,
                 'artifacts', window.cloudAppId,
-                'users', window.cloudUser.uid,
+                'shared', SHARED_CLOUD_NAMESPACE,
                 'classData', 'main'
             );
         }
@@ -1128,8 +1136,10 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
             const merged = { ...existing, ...incoming };
 
             // 1. Merge students and scoring history
-            if (Array.isArray(incoming.students) && incoming.students.length > 0) {
-                if (!Array.isArray(existing.students) || existing.students.length === 0) {
+            if (Array.isArray(incoming.students)) {
+                if (incoming.students.length === 0) {
+                    merged.students = [];
+                } else if (!Array.isArray(existing.students) || existing.students.length === 0) {
                     merged.students = incoming.students;
                 } else {
                     const studentMap = new Map();
@@ -1206,10 +1216,14 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
 
             // 6. Merge audit log
             if (Array.isArray(incoming.authAuditLog)) {
-                const logMap = new Map();
-                (existing.authAuditLog || []).forEach(l => { if (l && l.id) logMap.set(String(l.id), l); });
-                incoming.authAuditLog.forEach(l => { if (l && l.id) logMap.set(String(l.id), l); });
-                merged.authAuditLog = Array.from(logMap.values()).slice(-200);
+                if (incoming.authAuditLog.length === 0) {
+                    merged.authAuditLog = [];
+                } else {
+                    const logMap = new Map();
+                    (existing.authAuditLog || []).forEach(l => { if (l && l.id) logMap.set(String(l.id), l); });
+                    incoming.authAuditLog.forEach(l => { if (l && l.id) logMap.set(String(l.id), l); });
+                    merged.authAuditLog = Array.from(logMap.values()).slice(-800);
+                }
             }
 
             return merged;
@@ -1227,28 +1241,20 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
             heartbeatInterval: null,
             reconnectAttempts: 0,
 
+            initialized: false,
+
             init: function() {
+                if (this.initialized) return;
+                this.initialized = true;
                 this.initBroadcastChannel();
-                this.initSSE();
-                this.startHeartbeat();
-                this.pullFromServer(true);
+                this.setStatus((navigator.onLine && window.useCloud) ? 'syncing' : 'offline');
 
+                // Netlify bản HTML tĩnh không có /api/sync/*. Firestore onSnapshot
+                // ở safeStartApp mới là kênh realtime đa thiết bị chính.
                 window.addEventListener('online', () => {
-                    this.setStatus('syncing');
-                    this.reconnectAttempts = 0;
-                    this.initSSE();
-                    this.pullFromServer(false);
+                    this.setStatus(window.useCloud ? 'syncing' : 'offline');
                 });
-
-                window.addEventListener('offline', () => {
-                    this.setStatus('offline');
-                });
-
-                document.addEventListener('visibilitychange', () => {
-                    if (document.visibilityState === 'visible') {
-                        this.pullFromServer(false);
-                    }
-                });
+                window.addEventListener('offline', () => this.setStatus('offline'));
             },
 
             setStatus: function(s) {
@@ -1406,7 +1412,7 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
                         });
                     } catch (_) {}
                 }
-                this.pushToServer(state);
+                // Không gọi /api/sync/save. saveData() sẽ ghi trực tiếp Firestore.
             },
 
             applyRemoteState: function(remoteState, remoteUpdatedAt, source) {
@@ -1439,28 +1445,45 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
             const now = Date.now();
             state.__lastUpdatedAt = now;
 
-            // 1) Bắt buộc lưu local trước
+            // 1) Luôn lưu local ngay để không mất dữ liệu nếu mạng chập chờn.
             persistLocalData();
 
-            // 2) Phát sóng đồng bộ thời gian thực đến tất cả tài khoản & thiết bị
+            // 2) Đồng bộ tức thời giữa các tab cùng thiết bị/origin.
             if (window.GVCN_SYNC && typeof window.GVCN_SYNC.notifyLocalSave === 'function') {
                 window.GVCN_SYNC.notifyLocalSave();
             }
 
-            // 3) Đồng bộ Firestore nếu có cấu hình Firebase
+            // 3) Firestore là nguồn dữ liệu dùng chung cho TẤT CẢ tài khoản/thiết bị.
             if (window.useCloud && window.cloudDb && window.cloudUser && window.cloudSetDoc) {
+                // Chưa nhận snapshot đầu tiên: chỉ xếp hàng, tuyệt đối không ghi đè Cloud.
+                if (!window.__cloudInitialSnapshotReady) {
+                    window.__cloudWritePending = true;
+                    window.GVCN_SYNC?.setStatus?.('syncing');
+                    return;
+                }
+
                 try {
                     const docRef = getCloudDataDocRef();
                     if (!docRef) return;
+                    window.GVCN_SYNC?.setStatus?.('syncing');
                     await window.cloudSetDoc(docRef, {
                         state: state,
-                        updatedAt: now
+                        updatedAt: now,
+                        schemaVersion: 2,
+                        sharedNamespace: SHARED_CLOUD_NAMESPACE
                     }, { merge: true });
+                    window.__cloudWritePending = false;
                     window.__lastCloudSyncAt = now;
                     window.__lastCloudSyncError = null;
+                    if (window.GVCN_SYNC) {
+                        window.GVCN_SYNC.lastSyncedAt = now;
+                        window.GVCN_SYNC.setStatus('online');
+                    }
                 } catch (e) {
+                    window.__cloudWritePending = true;
                     window.__lastCloudSyncError = e;
-                    console.warn('[9A] Lưu Cloud lỗi; dữ liệu local vẫn được giữ an toàn:', e);
+                    window.GVCN_SYNC?.setStatus?.('offline');
+                    console.warn('[9A] Lưu Firestore dùng chung lỗi; dữ liệu local vẫn được giữ an toàn:', e);
                 }
             }
         }
@@ -5372,7 +5395,7 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
                                 </div>
                                 <div>
                                     <h3 class="font-black text-lg text-yellow-200 tracking-tight">TRẠNG THÁI ĐỒNG BỘ ĐA THIẾT BỊ</h3>
-                                    <p class="text-xs text-emerald-100/80 font-medium">Đồng bộ tự động & thời gian thực trên mọi tài khoản</p>
+                                    <p class="text-xs text-emerald-100/80 font-medium">Firestore dùng chung • thời gian thực trên mọi tài khoản & thiết bị</p>
                                 </div>
                             </div>
                             <button onclick="closeModal('gvcn-sync-modal')" class="text-white/80 hover:text-white bg-white/10 hover:bg-white/20 p-2.5 rounded-full transition-colors relative z-10">
@@ -5426,7 +5449,7 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
                                 </div>
                                 <div class="flex items-center justify-between pb-2 border-b border-slate-100">
                                     <span class="text-slate-500 font-semibold flex items-center gap-1.5"><i class="ph-bold ph-broadcast text-slate-400"></i> Kênh truyền phát:</span>
-                                    <span class="font-bold text-emerald-600 bg-emerald-50 px-2.5 py-0.5 rounded-md">Server SSE + Local Channel</span>
+                                    <span class="font-bold text-emerald-600 bg-emerald-50 px-2.5 py-0.5 rounded-md">Firebase Firestore Realtime + Local Channel</span>
                                 </div>
                                 <div class="flex items-center justify-between">
                                     <span class="text-slate-500 font-semibold flex items-center gap-1.5"><i class="ph-bold ph-shield-check text-slate-400"></i> Bảo vệ dữ liệu:</span>
@@ -5460,17 +5483,17 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
         window.forceSyncNow = async function() {
             const btn = document.getElementById('force-sync-btn');
             if (btn) {
-                btn.innerHTML = '<i class="ph-bold ph-arrows-clockwise animate-spin text-sm"></i><span>Đang tải...</span>';
+                btn.innerHTML = '<i class="ph-bold ph-arrows-clockwise animate-spin text-sm"></i><span>Đang đồng bộ...</span>';
                 btn.disabled = true;
             }
-            if (window.GVCN_SYNC && typeof window.GVCN_SYNC.pullFromServer === 'function') {
-                await window.GVCN_SYNC.pullFromServer(false);
-            }
-            if (window.GVCN_SYNC && typeof window.GVCN_SYNC.pushToServer === 'function') {
-                await window.GVCN_SYNC.pushToServer(state);
-            }
+
+            await saveData();
+            const ok = !window.__lastCloudSyncError && window.__cloudInitialSnapshotReady && window.useCloud;
+
             if (btn) {
-                btn.innerHTML = '<i class="ph-bold ph-check text-sm text-emerald-300"></i><span>Đã xong!</span>';
+                btn.innerHTML = ok
+                    ? '<i class="ph-bold ph-check text-sm text-emerald-300"></i><span>Đã xong!</span>'
+                    : '<i class="ph-bold ph-warning text-sm text-amber-300"></i><span>Chờ Cloud</span>';
                 setTimeout(() => {
                     if (btn) {
                         btn.innerHTML = '<i class="ph-bold ph-arrows-clockwise text-sm"></i><span>Đồng bộ ngay</span>';
@@ -5478,13 +5501,17 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
                     }
                 }, 1500);
             }
+
             const timeEl = document.getElementById('sync-modal-time');
-            if (timeEl) {
+            if (timeEl && ok) {
                 const now = new Date();
                 timeEl.textContent = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')} (Vừa xong)`;
             }
             if (typeof showToast === 'function') {
-                showToast('Đã đồng bộ toàn bộ dữ liệu lớp học với máy chủ thành công!', 'success');
+                showToast(ok
+                    ? 'Đã đồng bộ dữ liệu lớp học lên Firebase cho tất cả thiết bị!'
+                    : 'Dữ liệu đã lưu trên máy. Firestore chưa sẵn sàng hoặc chưa được cấp quyền.',
+                    ok ? 'success' : 'error');
             }
         };
 
@@ -5725,10 +5752,15 @@ window.copyTextSafe = async function(text) {
             const docRef = getCloudDataDocRef();
             if (!docRef) return;
 
+            window.GVCN_SYNC?.setStatus?.('syncing');
             window.cloudOnSnapshot(docRef, async (docSnap) => {
                 try {
+                    const isFirstCloudSnapshot = !window.__cloudInitialSnapshotReady;
+
                     if (!docSnap.exists()) {
-                        // Cloud chưa có dữ liệu: chỉ lúc này mới đưa state hiện tại lên Cloud.
+                        // Kho dùng chung chưa tồn tại: thiết bị đầu tiên tạo dữ liệu chuẩn cho lớp.
+                        window.__cloudInitialSnapshotReady = true;
+                        window.GVCN_SYNC?.setStatus?.('online');
                         await saveData();
                         return;
                     }
@@ -5739,35 +5771,54 @@ window.copyTextSafe = async function(text) {
 
                     const remoteTs = Number(payload.updatedAt || remoteState.__lastUpdatedAt || 0);
                     const localTs = Number(state.__lastUpdatedAt || 0);
-                    const hasLocal = !!window.__hasLocalData;
+                    const hadPendingWrite = !!window.__cloudWritePending;
 
-                    // Quy tắc chống ghi đè:
-                    // - Không có local thật sự -> Cloud thắng.
-                    // - Cloud có timestamp mới hơn -> Cloud thắng.
-                    // - Local mới hơn -> giữ local và đẩy local lên Cloud.
-                    // - Cả hai là dữ liệu cũ chưa có timestamp -> ưu tiên local để tránh mất dữ liệu đã nhập.
-                    const shouldUseRemote = !hasLocal || remoteTs > localTs;
-
-                    if (shouldUseRemote) {
-                        window.__suppressAutoSaveDuringBoot = true;
-                        state = { ...state, ...remoteState };
-                        applyStateDefaults();
+                    window.__suppressAutoSaveDuringBoot = true;
+                    if (isFirstCloudSnapshot) {
+                        // Lần đầu mở trên thiết bị mới: Cloud là nguồn chuẩn.
+                        // Nếu thiết bị đã có dữ liệu local thật sự, chỉ hợp nhất để giữ các bản ghi
+                        // chưa có trên Cloud; dữ liệu Cloud thắng khi trùng ID/trường.
+                        state = hadLocalData
+                            ? smartMergeStateObjects(state, remoteState)
+                            : { ...state, ...remoteState };
+                        state.__lastUpdatedAt = Math.max(remoteTs, Number(state.__lastUpdatedAt || 0));
+                        window.__cloudInitialSnapshotReady = true;
+                    } else if (remoteTs > localTs) {
+                        // Realtime từ thiết bị khác: nhận bản mới hơn và hợp nhất an toàn.
+                        state = smartMergeStateObjects(state, remoteState);
+                        state.__lastUpdatedAt = remoteTs;
+                    } else {
                         window.__suppressAutoSaveDuringBoot = false;
+                        window.GVCN_SYNC?.setStatus?.('online');
+                        return;
+                    }
 
-                        isDataLoaded = true;
-                        persistLocalData(); // Cloud tải được thì cập nhật cache local ngay.
-                        renderLayout();
-                    } else if (localTs > remoteTs || (hasLocal && localTs === 0 && remoteTs === 0)) {
-                        // Nâng dữ liệu local cũ lên định dạng có timestamp và đồng bộ lại Cloud.
+                    applyStateDefaults();
+                    isDataLoaded = true;
+                    persistLocalData();
+                    window.__suppressAutoSaveDuringBoot = false;
+
+                    if (window.GVCN_SYNC) {
+                        window.GVCN_SYNC.lastSyncedAt = Date.now();
+                        window.GVCN_SYNC.setStatus('online');
+                    }
+                    renderLayout();
+
+                    // Nếu người dùng đã thao tác trước khi snapshot đầu tiên về,
+                    // gửi bản state đã hợp nhất lên Cloud sau khi quá trình bootstrap an toàn hoàn tất.
+                    if (isFirstCloudSnapshot && hadPendingWrite) {
+                        window.__cloudWritePending = false;
                         await saveData();
                     }
                 } catch (syncErr) {
                     window.__suppressAutoSaveDuringBoot = false;
-                    console.warn('[9A] Lỗi áp dụng dữ liệu Cloud; tiếp tục dùng local:', syncErr);
+                    window.GVCN_SYNC?.setStatus?.('offline');
+                    console.warn('[9A] Lỗi áp dụng dữ liệu Firestore dùng chung; tiếp tục dùng local:', syncErr);
                 }
             }, (error) => {
-                console.warn('[9A] Firestore snapshot lỗi, tiếp tục dùng dữ liệu cục bộ:', error);
-                window.useCloud = false;
+                console.warn('[9A] Firestore snapshot lỗi. Kiểm tra Firestore Rules/Anonymous Auth:', error);
+                window.__lastCloudSyncError = error;
+                window.GVCN_SYNC?.setStatus?.('offline');
             });
         } catch (error) {
             console.warn('[9A] Không thể đăng ký Cloud, tiếp tục offline:', error);

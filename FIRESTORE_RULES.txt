@@ -1,0 +1,19 @@
+// THÊM match này vào Firestore Rules hiện tại của dự án.
+// Không cần xóa các rule cũ nếu app còn dùng đường dẫn cũ cho dữ liệu khác.
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Dữ liệu lớp dùng chung cho tất cả thiết bị/tài khoản của app.
+    // App vẫn yêu cầu Firebase Authentication (Anonymous Auth cũng được).
+    match /artifacts/{appId}/shared/{sharedId}/classData/{docId} {
+      allow read, write: if request.auth != null;
+    }
+
+    // Giữ tương thích với cấu trúc cũ theo UID (nếu bạn đang dùng).
+    match /artifacts/{appId}/users/{userId}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}
