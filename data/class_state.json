@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "updatedAt": 1787406168653,
+  "state": {
+    "admin": {
+      "className": "LỚP 12A1",
+      "name": "Thầy Giáo"
+    },
+    "students": [
+      {
+        "id": 1,
+        "name": "Nguyễn Văn A",
+        "points": 10,
+        "history": []
+      }
+    ],
+    "__lastUpdatedAt": 1787406168653
+  }
+}

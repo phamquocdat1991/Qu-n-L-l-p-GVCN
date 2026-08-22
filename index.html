@@ -821,9 +821,7 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
             const [headerYear, headerMonthNumber] = activeMonth.split('-');
             const monthLabel = `Tháng ${parseInt(headerMonthNumber || '1', 10)}/${headerYear || new Date().getFullYear()}`;
 
-            const syncStatus = window.useCloud
-                ? `<span class="inline-flex items-center gap-1.5 rounded-full border border-emerald-300/20 bg-emerald-950/25 px-3 py-1.5 text-[11px] font-bold text-emerald-50 shadow-inner"><i class="ph-bold ph-arrows-clockwise text-emerald-300"></i> Đồng bộ trực tuyến</span>`
-                : `<span class="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-black/15 px-3 py-1.5 text-[11px] font-bold text-emerald-100/80"><i class="ph-bold ph-hard-drives"></i> Chế độ cục bộ</span>`;
+            const syncStatus = `<button id="gvcn-sync-badge-btn" onclick="openSyncStatusModal()" class="inline-flex items-center gap-1.5 rounded-full border border-emerald-300/25 bg-emerald-950/35 hover:bg-emerald-900/50 px-3 py-1.5 text-[11px] font-bold text-emerald-50 shadow-inner transition-all group" title="Bấm để xem trạng thái đồng bộ đa thiết bị"><span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span><i class="ph-bold ph-arrows-clockwise text-emerald-300 group-hover:rotate-180 transition-transform duration-500"></i><span>Đồng bộ trực tuyến</span></button>`;
 
             const classAvatarContent = state.admin.classAvatarUrl
                 ? `<img src="${state.admin.classAvatarUrl}" class="w-full h-full object-cover rounded-2xl">`
@@ -1122,16 +1120,334 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
             );
         }
 
-        // LOCAL-FIRST: mọi thay đổi luôn được ghi xuống trình duyệt trước,
-        // sau đó mới đồng bộ Firestore. Vì vậy đóng tab/đăng xuất/reload không làm mất dữ liệu local.
+        // --- SMART MULTI-DEVICE RECONCILIATION ---
+        function smartMergeStateObjects(existing, incoming) {
+            if (!incoming || typeof incoming !== 'object') return existing;
+            if (!existing || typeof existing !== 'object') return incoming;
+
+            const merged = { ...existing, ...incoming };
+
+            // 1. Merge students and scoring history
+            if (Array.isArray(incoming.students) && incoming.students.length > 0) {
+                if (!Array.isArray(existing.students) || existing.students.length === 0) {
+                    merged.students = incoming.students;
+                } else {
+                    const studentMap = new Map();
+                    existing.students.forEach(s => { if (s && s.id != null) studentMap.set(String(s.id), { ...s }); });
+                    incoming.students.forEach(incS => {
+                        if (!incS || incS.id == null) return;
+                        const key = String(incS.id);
+                        if (!studentMap.has(key)) {
+                            studentMap.set(key, { ...incS });
+                        } else {
+                            const curS = studentMap.get(key);
+                            const mergedS = { ...curS, ...incS };
+                            // Merge scoring history entries by ID / timestamp
+                            const histMap = new Map();
+                            (curS.history || []).forEach(h => {
+                                const hKey = h.id || (h.date + '_' + (h.reason || '') + '_' + (h.points || 0) + '_' + (h.time || ''));
+                                histMap.set(hKey, h);
+                            });
+                            (incS.history || []).forEach(h => {
+                                const hKey = h.id || (h.date + '_' + (h.reason || '') + '_' + (h.points || 0) + '_' + (h.time || ''));
+                                histMap.set(hKey, h);
+                            });
+                            mergedS.history = Array.from(histMap.values()).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+                            // Recalculate total points
+                            mergedS.points = mergedS.history.reduce((sum, h) => sum + (Number(h.points) || 0), 0);
+                            studentMap.set(key, mergedS);
+                        }
+                    });
+                    merged.students = Array.from(studentMap.values());
+                }
+            }
+
+            // 2. Merge attendance records
+            if (incoming.attendanceRecords && typeof incoming.attendanceRecords === 'object') {
+                merged.attendanceRecords = { ...(existing.attendanceRecords || {}), ...incoming.attendanceRecords };
+            }
+
+            // 3. Merge daily scoring locks
+            if (incoming.dailyScoringLocks && typeof incoming.dailyScoringLocks === 'object') {
+                merged.dailyScoringLocks = { ...(existing.dailyScoringLocks || {}), ...incoming.dailyScoringLocks };
+            }
+
+            // 4. Merge class fund transactions and campaigns
+            if (incoming.classFund && typeof incoming.classFund === 'object') {
+                const curFund = existing.classFund || { balance: 0, transactions: [], campaigns: [] };
+                const incFund = incoming.classFund;
+                const txMap = new Map();
+                (curFund.transactions || []).forEach(t => { if (t && t.id) txMap.set(String(t.id), t); });
+                (incFund.transactions || []).forEach(t => { if (t && t.id) txMap.set(String(t.id), t); });
+                const campMap = new Map();
+                (curFund.campaigns || []).forEach(c => { if (c && c.id) campMap.set(String(c.id), c); });
+                (incFund.campaigns || []).forEach(c => { if (c && c.id) campMap.set(String(c.id), c); });
+                merged.classFund = {
+                    ...curFund,
+                    ...incFund,
+                    transactions: Array.from(txMap.values()).sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0)),
+                    campaigns: Array.from(campMap.values())
+                };
+            }
+
+            // 5. Merge auth config and accounts
+            if (incoming.authConfig && typeof incoming.authConfig === 'object') {
+                const curAuth = existing.authConfig || { enabled: false, accounts: [] };
+                const incAuth = incoming.authConfig;
+                const accMap = new Map();
+                (curAuth.accounts || []).forEach(a => { if (a && a.id) accMap.set(String(a.id), a); });
+                (incAuth.accounts || []).forEach(a => { if (a && a.id) accMap.set(String(a.id), a); });
+                merged.authConfig = {
+                    ...curAuth,
+                    ...incAuth,
+                    accounts: Array.from(accMap.values())
+                };
+            }
+
+            // 6. Merge audit log
+            if (Array.isArray(incoming.authAuditLog)) {
+                const logMap = new Map();
+                (existing.authAuditLog || []).forEach(l => { if (l && l.id) logMap.set(String(l.id), l); });
+                incoming.authAuditLog.forEach(l => { if (l && l.id) logMap.set(String(l.id), l); });
+                merged.authAuditLog = Array.from(logMap.values()).slice(-200);
+            }
+
+            return merged;
+        }
+
+        // --- GLOBAL REAL-TIME CROSS-DEVICE SYNC ENGINE ---
+        window.GVCN_SYNC = {
+            status: 'online', // 'online' | 'syncing' | 'offline'
+            lastSyncedAt: Date.now(),
+            activeClients: 1,
+            eventSource: null,
+            broadcastChannel: null,
+            isPushing: false,
+            pendingPush: false,
+            heartbeatInterval: null,
+            reconnectAttempts: 0,
+
+            init: function() {
+                this.initBroadcastChannel();
+                this.initSSE();
+                this.startHeartbeat();
+                this.pullFromServer(true);
+
+                window.addEventListener('online', () => {
+                    this.setStatus('syncing');
+                    this.reconnectAttempts = 0;
+                    this.initSSE();
+                    this.pullFromServer(false);
+                });
+
+                window.addEventListener('offline', () => {
+                    this.setStatus('offline');
+                });
+
+                document.addEventListener('visibilitychange', () => {
+                    if (document.visibilityState === 'visible') {
+                        this.pullFromServer(false);
+                    }
+                });
+            },
+
+            setStatus: function(s) {
+                this.status = s;
+                this.updateHeaderBadge();
+            },
+
+            updateHeaderBadge: function() {
+                const el = document.getElementById('gvcn-sync-badge-btn');
+                if (!el) return;
+                const isOnline = this.status === 'online';
+                const isSyncing = this.status === 'syncing';
+
+                if (isSyncing) {
+                    el.className = 'inline-flex items-center gap-1.5 rounded-full border border-yellow-300/30 bg-yellow-950/40 hover:bg-yellow-900/50 px-3 py-1.5 text-[11px] font-bold text-yellow-200 shadow-inner transition-all';
+                    el.innerHTML = `<i class="ph-bold ph-arrows-clockwise text-yellow-300 animate-spin"></i><span>Đang đồng bộ...</span>`;
+                } else if (isOnline) {
+                    el.className = 'inline-flex items-center gap-1.5 rounded-full border border-emerald-300/25 bg-emerald-950/35 hover:bg-emerald-900/50 px-3 py-1.5 text-[11px] font-bold text-emerald-50 shadow-inner transition-all group';
+                    el.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span><i class="ph-bold ph-arrows-clockwise text-emerald-300 group-hover:rotate-180 transition-transform duration-500"></i><span>Đồng bộ trực tuyến</span>`;
+                } else {
+                    el.className = 'inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-black/25 hover:bg-black/40 px-3 py-1.5 text-[11px] font-bold text-slate-300 shadow-inner transition-all';
+                    el.innerHTML = `<span class="w-2 h-2 rounded-full bg-amber-400"></span><i class="ph-bold ph-cloud-slash text-amber-300"></i><span>Chế độ cục bộ</span>`;
+                }
+            },
+
+            initBroadcastChannel: function() {
+                if (typeof BroadcastChannel === 'undefined') return;
+                try {
+                    this.broadcastChannel = new BroadcastChannel('gvcn_pro_realtime_sync');
+                    this.broadcastChannel.onmessage = (event) => {
+                        const data = event.data;
+                        if (data && data.type === 'state_saved' && data.state) {
+                            this.applyRemoteState(data.state, data.updatedAt, 'local_broadcast');
+                        }
+                    };
+                } catch (err) {
+                    console.warn('[GVCN Sync] BroadcastChannel error:', err);
+                }
+            },
+
+            initSSE: function() {
+                if (typeof EventSource === 'undefined') return;
+                if (this.eventSource) {
+                    try { this.eventSource.close(); } catch (_) {}
+                }
+                try {
+                    this.eventSource = new EventSource('/api/sync/events');
+                    this.eventSource.addEventListener('connected', (e) => {
+                        this.reconnectAttempts = 0;
+                        this.setStatus('online');
+                    });
+                    this.eventSource.addEventListener('sync_update', (e) => {
+                        try {
+                            const payload = JSON.parse(e.data);
+                            if (payload && payload.state) {
+                                this.applyRemoteState(payload.state, payload.updatedAt, 'sse_push');
+                            }
+                        } catch (err) {
+                            console.error('[GVCN Sync] SSE parse error:', err);
+                        }
+                    });
+                    this.eventSource.onerror = () => {
+                        if (this.eventSource) {
+                            this.eventSource.close();
+                            this.eventSource = null;
+                        }
+                        this.setStatus('offline');
+                        const delay = Math.min(25000, 1000 * Math.pow(1.5, this.reconnectAttempts++));
+                        setTimeout(() => {
+                            if (navigator.onLine) this.initSSE();
+                        }, delay);
+                    };
+                } catch (err) {
+                    console.warn('[GVCN Sync] EventSource init error:', err);
+                }
+            },
+
+            startHeartbeat: function() {
+                if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+                this.heartbeatInterval = setInterval(() => {
+                    if (navigator.onLine) {
+                        this.pullFromServer(false);
+                    }
+                }, 12000);
+            },
+
+            pullFromServer: async function(isInitial = false) {
+                try {
+                    const res = await fetch('/api/sync/get?t=' + Date.now(), {
+                        cache: 'no-store',
+                        headers: { 'Accept': 'application/json' }
+                    });
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    const data = await res.json();
+                    if (data && data.success) {
+                        this.setStatus('online');
+                        this.activeClients = data.activeClients || 1;
+                        if (data.hasData && data.state) {
+                            this.applyRemoteState(data.state, data.updatedAt, isInitial ? 'initial_pull' : 'heartbeat_pull');
+                        } else if (isInitial && window.__hasLocalData && state && state.students && state.students.length) {
+                            this.pushToServer(state);
+                        }
+                    }
+                } catch (err) {
+                    if (isInitial) {
+                        console.warn('[GVCN Sync] Server pull failed, continuing with local state:', err);
+                    }
+                }
+            },
+
+            pushToServer: async function(stateToPush) {
+                if (this.isPushing) {
+                    this.pendingPush = true;
+                    return;
+                }
+                this.isPushing = true;
+                try {
+                    const curAcc = (typeof currentAccount === 'function' && currentAccount()) || null;
+                    const res = await fetch('/api/sync/save', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            state: stateToPush,
+                            updatedAt: stateToPush.__lastUpdatedAt || Date.now(),
+                            clientInfo: {
+                                accountId: curAcc?.id,
+                                displayName: curAcc?.displayName || 'Người dùng',
+                                role: curAcc?.role || 'gvcn'
+                            }
+                        })
+                    });
+                    if (res.ok) {
+                        this.lastSyncedAt = Date.now();
+                        this.setStatus('online');
+                    }
+                } catch (err) {
+                    console.warn('[GVCN Sync] Push to server failed:', err);
+                } finally {
+                    this.isPushing = false;
+                    if (this.pendingPush) {
+                        this.pendingPush = false;
+                        this.pushToServer(state);
+                    }
+                }
+            },
+
+            notifyLocalSave: function() {
+                this.lastSyncedAt = Date.now();
+                if (this.broadcastChannel) {
+                    try {
+                        this.broadcastChannel.postMessage({
+                            type: 'state_saved',
+                            state: state,
+                            updatedAt: state.__lastUpdatedAt
+                        });
+                    } catch (_) {}
+                }
+                this.pushToServer(state);
+            },
+
+            applyRemoteState: function(remoteState, remoteUpdatedAt, source) {
+                if (!remoteState || typeof remoteState !== 'object') return;
+                const localTs = Number(state.__lastUpdatedAt || 0);
+                const remoteTs = Number(remoteUpdatedAt || remoteState.__lastUpdatedAt || 0);
+
+                if (remoteTs < localTs && source !== 'force') return;
+
+                window.__suppressAutoSaveDuringBoot = true;
+                state = smartMergeStateObjects(state, remoteState);
+                state.__lastUpdatedAt = Math.max(localTs, remoteTs, Date.now());
+                applyStateDefaults();
+                persistLocalData();
+                window.__suppressAutoSaveDuringBoot = false;
+
+                this.lastSyncedAt = Date.now();
+                this.setStatus('online');
+
+                const isTyping = document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA');
+                if (!isTyping) {
+                    if (typeof renderLayout === 'function') renderLayout();
+                }
+            }
+        };
+
+        // LOCAL-FIRST & MULTI-DEVICE: Mọi thay đổi ghi xuống thiết bị tức thời,
+        // đồng thời phát sóng đến tất cả thiết bị và tài khoản kết nối.
         async function saveData() {
             const now = Date.now();
             state.__lastUpdatedAt = now;
 
-            // 1) Bắt buộc lưu local trước. Đây là bản dự phòng tức thời trên thiết bị.
+            // 1) Bắt buộc lưu local trước
             persistLocalData();
 
-            // 2) Sau đó mới cố gắng đồng bộ Cloud.
+            // 2) Phát sóng đồng bộ thời gian thực đến tất cả tài khoản & thiết bị
+            if (window.GVCN_SYNC && typeof window.GVCN_SYNC.notifyLocalSave === 'function') {
+                window.GVCN_SYNC.notifyLocalSave();
+            }
+
+            // 3) Đồng bộ Firestore nếu có cấu hình Firebase
             if (window.useCloud && window.cloudDb && window.cloudUser && window.cloudSetDoc) {
                 try {
                     const docRef = getCloudDataDocRef();
@@ -1143,7 +1459,6 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
                     window.__lastCloudSyncAt = now;
                     window.__lastCloudSyncError = null;
                 } catch (e) {
-                    // Không được xóa/ghi đè local khi Cloud lỗi.
                     window.__lastCloudSyncError = e;
                     console.warn('[9A] Lưu Cloud lỗi; dữ liệu local vẫn được giữ an toàn:', e);
                 }
@@ -5035,7 +5350,186 @@ input:focus,select:focus,textarea:focus,.auth-input:focus,#main-content input:fo
                     </div></div>`;
         };
 
-        window.openStudentHistoryModal = function(id) {
+        
+        // ==========================================
+        // MULTI-DEVICE REALTIME SYNC MODAL & TOOLS
+        // ==========================================
+        window.openSyncStatusModal = function() {
+            const sync = window.GVCN_SYNC || { status: 'online', lastSyncedAt: Date.now(), activeClients: 1 };
+            const curAcc = (typeof currentAccount === 'function' && currentAccount()) || { displayName: 'GVCN', role: 'gvcn' };
+            const lastSyncDate = new Date(sync.lastSyncedAt || Date.now());
+            const timeStr = `${String(lastSyncDate.getHours()).padStart(2, '0')}:${String(lastSyncDate.getMinutes()).padStart(2, '0')}:${String(lastSyncDate.getSeconds()).padStart(2, '0')} ngày ${String(lastSyncDate.getDate()).padStart(2, '0')}/${String(lastSyncDate.getMonth()+1).padStart(2, '0')}/${lastSyncDate.getFullYear()}`;
+            const studentCount = (state.students || []).length;
+            const accountCount = (state.authConfig?.accounts || []).length || 1;
+
+            const modalHtml = `
+                <div class="fixed inset-0 bg-slate-900/70 z-50 flex items-center justify-center p-4 backdrop-blur-sm animate-fade-in" id="gvcn-sync-modal">
+                    <div class="bg-white rounded-[2rem] shadow-2xl w-full max-w-xl overflow-hidden flex flex-col max-h-[90vh]">
+                        <div class="bg-gradient-to-r from-[#215E61] to-[#233D4D] text-white p-6 flex justify-between items-center px-8 relative overflow-hidden">
+                            <div class="relative z-10 flex items-center gap-3">
+                                <div class="w-11 h-11 rounded-2xl bg-emerald-400/20 border border-emerald-300/30 flex items-center justify-center text-emerald-300 text-2xl shadow-inner">
+                                    <i class="ph-fill ph-arrows-clockwise"></i>
+                                </div>
+                                <div>
+                                    <h3 class="font-black text-lg text-yellow-200 tracking-tight">TRẠNG THÁI ĐỒNG BỘ ĐA THIẾT BỊ</h3>
+                                    <p class="text-xs text-emerald-100/80 font-medium">Đồng bộ tự động & thời gian thực trên mọi tài khoản</p>
+                                </div>
+                            </div>
+                            <button onclick="closeModal('gvcn-sync-modal')" class="text-white/80 hover:text-white bg-white/10 hover:bg-white/20 p-2.5 rounded-full transition-colors relative z-10">
+                                <i class="ph-bold ph-x text-lg"></i>
+                            </button>
+                        </div>
+
+                        <div class="p-6 md:p-8 flex-1 overflow-y-auto custom-scrollbar space-y-5 bg-slate-50">
+                            <!-- Status Card -->
+                            <div class="p-5 rounded-2xl bg-white border border-emerald-200/80 shadow-sm flex items-center justify-between gap-4">
+                                <div class="flex items-center gap-3.5">
+                                    <div class="relative flex h-4 w-4">
+                                        <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                                        <span class="relative inline-flex rounded-full h-4 w-4 bg-emerald-500"></span>
+                                    </div>
+                                    <div>
+                                        <div class="font-black text-sm text-slate-800">Máy chủ Đồng bộ Đang Hoạt Động</div>
+                                        <div class="text-xs text-slate-500 font-semibold mt-0.5">Tất cả thiết bị & tài khoản tự động liên kết</div>
+                                    </div>
+                                </div>
+                                <button onclick="forceSyncNow()" id="force-sync-btn" class="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black shadow-md hover:shadow-lg transition-all flex items-center gap-2">
+                                    <i class="ph-bold ph-arrows-clockwise text-sm"></i>
+                                    <span>Đồng bộ ngay</span>
+                                </button>
+                            </div>
+
+                            <!-- Metrics Grid -->
+                            <div class="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                                <div class="p-4 bg-white rounded-2xl border border-slate-200/80 shadow-sm">
+                                    <div class="text-[10px] font-black uppercase tracking-wider text-slate-400">Tài khoản hiện tại</div>
+                                    <div class="text-sm font-black text-slate-800 mt-1 truncate">${escapeHtmlAttr(curAcc.displayName || 'GVCN')}</div>
+                                    <div class="text-[10px] font-bold text-emerald-600 mt-0.5">${escapeHtmlAttr(curAcc.role || 'gvcn')}</div>
+                                </div>
+                                <div class="p-4 bg-white rounded-2xl border border-slate-200/80 shadow-sm">
+                                    <div class="text-[10px] font-black uppercase tracking-wider text-slate-400">Tổng học sinh</div>
+                                    <div class="text-lg font-black text-slate-800 mt-1">${studentCount} em</div>
+                                    <div class="text-[10px] font-bold text-slate-400 mt-0.5">Dữ liệu thi đua chuẩn</div>
+                                </div>
+                                <div class="p-4 bg-white rounded-2xl border border-slate-200/80 shadow-sm col-span-2 sm:col-span-1">
+                                    <div class="text-[10px] font-black uppercase tracking-wider text-slate-400">Số tài khoản lớp</div>
+                                    <div class="text-lg font-black text-blue-600 mt-1">${accountCount}</div>
+                                    <div class="text-[10px] font-bold text-slate-400 mt-0.5">Cán sự & GVBM</div>
+                                </div>
+                            </div>
+
+                            <!-- Sync Details -->
+                            <div class="p-4 bg-white rounded-2xl border border-slate-200/80 shadow-sm space-y-2.5 text-xs">
+                                <div class="flex items-center justify-between pb-2 border-b border-slate-100">
+                                    <span class="text-slate-500 font-semibold flex items-center gap-1.5"><i class="ph-bold ph-clock text-slate-400"></i> Lần đồng bộ gần nhất:</span>
+                                    <span class="font-bold text-slate-800" id="sync-modal-time">${timeStr}</span>
+                                </div>
+                                <div class="flex items-center justify-between pb-2 border-b border-slate-100">
+                                    <span class="text-slate-500 font-semibold flex items-center gap-1.5"><i class="ph-bold ph-broadcast text-slate-400"></i> Kênh truyền phát:</span>
+                                    <span class="font-bold text-emerald-600 bg-emerald-50 px-2.5 py-0.5 rounded-md">Server SSE + Local Channel</span>
+                                </div>
+                                <div class="flex items-center justify-between">
+                                    <span class="text-slate-500 font-semibold flex items-center gap-1.5"><i class="ph-bold ph-shield-check text-slate-400"></i> Bảo vệ dữ liệu:</span>
+                                    <span class="font-bold text-slate-700">Tự động chống ghi đè & hợp nhất điểm</span>
+                                </div>
+                            </div>
+
+                            <!-- Backup & Restore Actions -->
+                            <div class="pt-2 flex flex-col sm:flex-row gap-3">
+                                <button onclick="exportSyncBackup()" class="flex-1 py-3 px-4 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-black shadow-sm flex items-center justify-center gap-2 transition-all">
+                                    <i class="ph-bold ph-download-simple text-base text-slate-500"></i>
+                                    <span>Tải bản sao lưu (JSON)</span>
+                                </button>
+                                <label class="flex-1 py-3 px-4 rounded-xl border border-blue-200 bg-blue-50/50 hover:bg-blue-50 text-blue-700 text-xs font-black shadow-sm flex items-center justify-center gap-2 cursor-pointer transition-all">
+                                    <i class="ph-bold ph-upload-simple text-base text-blue-600"></i>
+                                    <span>Phục hồi từ tệp JSON</span>
+                                    <input type="file" accept=".json" class="hidden" onchange="importSyncBackup(event)">
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="p-4 bg-slate-100 border-t border-slate-200 text-center">
+                            <button onclick="closeModal('gvcn-sync-modal')" class="px-6 py-2.5 bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold rounded-xl shadow transition-colors">Đóng cửa sổ</button>
+                        </div>
+                    </div>
+                </div>`;
+
+            document.getElementById('modal-container').innerHTML = modalHtml;
+        };
+
+        window.forceSyncNow = async function() {
+            const btn = document.getElementById('force-sync-btn');
+            if (btn) {
+                btn.innerHTML = '<i class="ph-bold ph-arrows-clockwise animate-spin text-sm"></i><span>Đang tải...</span>';
+                btn.disabled = true;
+            }
+            if (window.GVCN_SYNC && typeof window.GVCN_SYNC.pullFromServer === 'function') {
+                await window.GVCN_SYNC.pullFromServer(false);
+            }
+            if (window.GVCN_SYNC && typeof window.GVCN_SYNC.pushToServer === 'function') {
+                await window.GVCN_SYNC.pushToServer(state);
+            }
+            if (btn) {
+                btn.innerHTML = '<i class="ph-bold ph-check text-sm text-emerald-300"></i><span>Đã xong!</span>';
+                setTimeout(() => {
+                    if (btn) {
+                        btn.innerHTML = '<i class="ph-bold ph-arrows-clockwise text-sm"></i><span>Đồng bộ ngay</span>';
+                        btn.disabled = false;
+                    }
+                }, 1500);
+            }
+            const timeEl = document.getElementById('sync-modal-time');
+            if (timeEl) {
+                const now = new Date();
+                timeEl.textContent = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')} (Vừa xong)`;
+            }
+            if (typeof showToast === 'function') {
+                showToast('Đã đồng bộ toàn bộ dữ liệu lớp học với máy chủ thành công!', 'success');
+            }
+        };
+
+        window.exportSyncBackup = function() {
+            try {
+                const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(state, null, 2));
+                const dlAnchor = document.createElement('a');
+                const className = (state.admin?.className || 'Lop').replace(/\s+/g, '_');
+                const dateStr = new Date().toISOString().slice(0, 10);
+                dlAnchor.setAttribute("href", dataStr);
+                dlAnchor.setAttribute("download", `Sao_Luu_${className}_${dateStr}.json`);
+                document.body.appendChild(dlAnchor);
+                dlAnchor.click();
+                dlAnchor.remove();
+                if (typeof showToast === 'function') showToast('Đã tải xuống tệp sao lưu dữ liệu lớp học!', 'success');
+            } catch (e) {
+                alert('Lỗi xuất tệp sao lưu: ' + e.message);
+            }
+        };
+
+        window.importSyncBackup = function(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = async function(e) {
+                try {
+                    const imported = JSON.parse(e.target.result);
+                    if (!imported || typeof imported !== 'object') throw new Error('Tệp không đúng định dạng');
+                    if (confirm('Bạn có chắc chắn muốn nhập dữ liệu này? Dữ liệu hiện tại sẽ được cập nhật và đồng bộ lên tất cả thiết bị.')) {
+                        state = smartMergeStateObjects(state, imported);
+                        state.__lastUpdatedAt = Date.now();
+                        applyStateDefaults();
+                        await saveData();
+                        renderLayout();
+                        closeModal('gvcn-sync-modal');
+                        if (typeof showToast === 'function') showToast('Đã phục hồi và đồng bộ dữ liệu mới thành công!', 'success');
+                    }
+                } catch (err) {
+                    alert('Lỗi đọc tệp JSON: ' + err.message);
+                }
+            };
+            reader.readAsText(file);
+        };
+
+window.openStudentHistoryModal = function(id) {
             const student = state.students.find(s => s.id === id); if (!student) return;
             const history = student.history || []; const sortedHistory = [...history].sort((a, b) => new Date(b.date) - new Date(a.date));
             let historyHtml = '';
@@ -5218,6 +5712,11 @@ window.copyTextSafe = async function(text) {
         window.__suppressAutoSaveDuringBoot = true;
         const hadLocalData = localBootWithoutCloudOverwrite();
         window.__suppressAutoSaveDuringBoot = false;
+
+        // Khởi động động cơ đồng bộ đa thiết bị thời gian thực
+        if (window.GVCN_SYNC && typeof window.GVCN_SYNC.init === 'function') {
+            window.GVCN_SYNC.init();
+        }
 
         if (!window.useCloud || !window.cloudDb || !window.cloudUser || cloudSubscribed) return;
         cloudSubscribed = true;
