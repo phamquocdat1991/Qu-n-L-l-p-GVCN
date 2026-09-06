@@ -4,6 +4,7 @@ import { extname, join, normalize, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
+const staticRoot = join(root, 'dist');
 const dataDir = join(root, 'data');
 const stateFilePath = join(dataDir, 'class_state.json');
 const port = Number(process.env.DEFAULT_APP_PORT || (process.env.PORT && process.env.PORT !== '8080' ? process.env.PORT : 3000));
@@ -323,14 +324,14 @@ const server = http.createServer(async (req, res) => {
   // --- STATIC FILE SERVING ---
   try {
     let rel = safePath(req.url);
-    let filePath = join(root, rel.replace(/^[/\\]+/, ''));
+    let filePath = join(staticRoot, rel.replace(/^[/\\]+/, ''));
 
     try {
       const s = await stat(filePath);
       if (s.isDirectory()) filePath = join(filePath, 'index.html');
     } catch {
       // Single-page fallback
-      filePath = join(root, 'index.html');
+      filePath = join(staticRoot, 'index.html');
     }
 
     const data = await readFile(filePath);
@@ -351,4 +352,3 @@ await initServerStorage();
 server.listen(port, '0.0.0.0', () => {
   console.log(`GVCN PRO Real-time Sync Server running on http://0.0.0.0:${port}`);
 });
-
