@@ -7,7 +7,8 @@ const root = fileURLToPath(new URL('.', import.meta.url));
 const staticRoot = join(root, 'dist');
 const dataDir = join(root, 'data');
 const stateFilePath = join(dataDir, 'class_state.json');
-const port = Number(process.env.DEFAULT_APP_PORT || (process.env.PORT && process.env.PORT !== '8080' ? process.env.PORT : 3000));
+const portArgument = process.argv.indexOf('--port');
+const port = Number((portArgument >= 0 ? process.argv[portArgument + 1] : undefined) || process.env.DEFAULT_APP_PORT || (process.env.PORT && process.env.PORT !== '8080' ? process.env.PORT : 3000));
 
 const mime = {
   '.html': 'text/html; charset=utf-8',
